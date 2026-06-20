@@ -1,0 +1,4 @@
+.env
+location-service
+*.exe
+vendor/
