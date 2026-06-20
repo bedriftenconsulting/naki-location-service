@@ -6,32 +6,105 @@ Real-time nurse location tracking for the NAKI platform. Manages live GPS update
 
 ### Location Flow
 
+```mermaid
+sequenceDiagram
+    participant NurseApp as Nurse App
+    participant GW as Gateway :9090
+    participant LocSvc as Location Service :8088
+    participant Redis
+    participant PostgreSQL
+    participant PatientApp as Patient App
+
+    Note over NurseApp,LocSvc: Nurse sends GPS every 30 seconds
+    NurseApp->>GW: POST /location/update {lat, lng, speed}
+    GW->>LocSvc: Forward with X-User-ID
+    LocSvc->>Redis: Cache nurse position (5-min TTL)
+    LocSvc->>PostgreSQL: Log to location_logs (async)
+    LocSvc-->>PatientApp: Push via WebSocket (if tracking)
+    LocSvc-->>GW: 200 OK
+    GW-->>NurseApp: Location updated
+
+    Note over PatientApp,LocSvc: Patient watches nurse on map
+    PatientApp->>GW: WS /location/track/{visit_id}/ws
+    GW->>LocSvc: WebSocket upgrade
+    LocSvc-->>PatientApp: Real-time nurse position + ETA + distance
 ```
-┌──────────────────┐        ┌──────────────────────┐
-│  Nurse App        │        │  Patient App          │
-│  (sends GPS every │        │  (watches nurse move  │
-│   30 seconds)     │        │   on map)             │
-└────────┬─────────┘        └──────────┬───────────┘
-         │                             │
-    POST /location/update         WebSocket /track/:id/ws
-         │                             │
-         ▼                             ▼
-┌────────────────────────────────────────────────────┐
-│               Location Service (:8088)              │
-│                                                     │
-│  ┌─────────┐   ┌──────────┐   ┌─────────────────┐ │
-│  │  Redis   │   │ PostgreSQL│   │  WebSocket Hub  │ │
-│  │ (live)   │   │ (history) │   │  (push updates) │ │
-│  │          │   │           │   │                 │ │
-│  │ nurse:   │   │ location_ │   │ Connected       │ │
-│  │ lat/lng  │   │ logs table│   │ patients get    │ │
-│  │ 5min TTL │   │           │   │ auto-pushed     │ │
-│  └─────────┘   └──────────┘   └─────────────────┘ │
-└────────────────────────────────────────────────────┘
-         ▲                             ▲
-         │                             │
-   Kafka: nurse.matched          Kafka: visit.completed
-   (creates active visit)        (stops tracking)
+
+### Architecture Overview
+
+```mermaid
+graph TB
+    subgraph Client Apps
+        NA[Nurse App<br/>GPS every 30s]
+        PA[Patient App<br/>Live map view]
+        AD[Admin Dashboard<br/>All nurses map]
+    end
+
+    subgraph Gateway
+        GW[API Gateway :9090]
+    end
+
+    subgraph Location Service :8088
+        API[REST API]
+        WS[WebSocket Hub]
+        TRACKER[Location Tracker]
+        KC[Kafka Consumer]
+    end
+
+    subgraph Data Stores
+        REDIS[(Redis DB 1<br/>Live Locations<br/>5-min TTL)]
+        PG[(PostgreSQL<br/>location_logs<br/>Permanent History)]
+    end
+
+    subgraph Kafka Events
+        K1[nurse.matched<br/>Start tracking]
+        K2[visit.completed<br/>Stop tracking]
+    end
+
+    NA -->|POST /location/update| GW
+    PA -->|WebSocket /track/:id/ws| GW
+    AD -->|GET /location/active| GW
+    GW --> API
+    GW --> WS
+
+    API --> TRACKER
+    TRACKER -->|Cache position| REDIS
+    TRACKER -->|Log history| PG
+    TRACKER -->|Notify clients| WS
+    WS -->|Push updates| PA
+
+    K1 -->|Consume| KC
+    K2 -->|Consume| KC
+    KC -->|Create active visit| REDIS
+    KC -->|Close tracking| WS
+```
+
+### Visit Tracking Lifecycle
+
+```mermaid
+flowchart TD
+    A[nurse.matched event from Kafka] --> B[Create active visit in Redis]
+    B --> C[Patient can now connect WebSocket]
+    
+    C --> D[Nurse app sends GPS update]
+    D --> E[Cache in Redis]
+    D --> F[Log to PostgreSQL]
+    D --> G{Visit has WebSocket clients?}
+    G -->|Yes| H[Calculate ETA + distance]
+    H --> I[Push update to all connected patients]
+    G -->|No| J[Skip push]
+    
+    I --> D
+    J --> D
+    
+    K[visit.completed event from Kafka] --> L[Send visit_completed to WebSocket clients]
+    L --> M[Close all WebSocket connections]
+    M --> N[Remove active visit from Redis]
+    N --> O[Location history preserved in PostgreSQL]
+
+    style A fill:#4CAF50,color:#fff
+    style K fill:#f44336,color:#fff
+    style O fill:#2196F3,color:#fff
 ```
 
 ### Step-by-Step
@@ -443,8 +516,14 @@ location:
 
 ### Gateway Routing
 
-```
-Client → Gateway (:9090) → /location/* → Location Service (:8088)
+```mermaid
+graph LR
+    Client[Client App] -->|HTTP / WebSocket| GW[Gateway :9090]
+    GW -->|/location/*| LS[Location Service :8088]
+    GW -->|Auth Headers| LS
+
+    style GW fill:#4CAF50,color:#fff
+    style LS fill:#FF9800,color:#fff
 ```
 
 ---
@@ -469,47 +548,64 @@ Client → Gateway (:9090) → /location/* → Location Service (:8088)
 
 ## How the Apps Integrate
 
-### Nurse App
+### Nurse App Flow
 
-```
-1. Nurse goes online → start sending location every 30s
-   POST /location/api/v1/location/update { lat, lng }
+```mermaid
+sequenceDiagram
+    participant Nurse as Nurse App
+    participant LocSvc as Location Service
 
-2. Nurse gets assigned to booking → include visit_id
-   POST /location/api/v1/location/update { lat, lng, visit_id: "booking-uuid" }
+    Note over Nurse: Nurse taps "Go Online"
+    loop Every 30 seconds
+        Nurse->>LocSvc: POST /location/update {lat, lng}
+        LocSvc-->>Nurse: 200 OK
+    end
 
-3. Nurse arrives at patient → speed drops to 0
-   Updates continue — patient sees nurse has arrived
+    Note over Nurse: Nurse gets assigned to booking
+    loop Every 30 seconds (during visit)
+        Nurse->>LocSvc: POST /location/update {lat, lng, visit_id}
+        LocSvc-->>Nurse: 200 OK
+        Note right of LocSvc: Push to patient WebSocket
+    end
 
-4. Visit completed → stop sending location (or keep sending without visit_id)
-```
-
-### Patient App
-
-```
-1. Booking confirmed, nurse assigned → get visit tracking info
-   GET /location/api/v1/location/track/{booking_id}
-
-2. Open live map → connect WebSocket
-   WS /location/api/v1/location/track/{booking_id}/ws
-
-3. Receive real-time updates:
-   - Nurse GPS position (move pin on map)
-   - ETA (show "8 minutes away")
-   - Distance (show "3.2 km")
-
-4. Visit complete → receive { status: "visit_completed" } → close map
+    Note over Nurse: Nurse arrives (speed → 0)
+    Note over Nurse: Visit completed → stop visit_id
+    Note over Nurse: Nurse taps "Go Offline" → stop updates
 ```
 
-### Admin Dashboard
+### Patient App Flow
 
+```mermaid
+sequenceDiagram
+    participant Patient as Patient App
+    participant LocSvc as Location Service
+
+    Note over Patient: Booking confirmed, nurse assigned
+    Patient->>LocSvc: GET /location/track/{booking_id}
+    LocSvc-->>Patient: Nurse position + ETA + distance
+
+    Note over Patient: Open live map
+    Patient->>LocSvc: WS /location/track/{booking_id}/ws
+    
+    loop Real-time updates
+        LocSvc-->>Patient: {nurse_location, eta, distance_km}
+        Note right of Patient: Move pin on map<br/>Update "8 min away"
+    end
+
+    LocSvc-->>Patient: {status: "visit_completed"}
+    Note over Patient: Close map
 ```
-1. Live map of all nurses
-   GET /location/api/v1/location/active
 
-2. All active visits
-   GET /location/api/v1/location/visits
+### Admin Dashboard Flow
 
-3. Replay a visit trail
-   GET /location/api/v1/location/visit/{visit_id}/trail
+```mermaid
+graph LR
+    AD[Admin Dashboard] -->|GET /location/active| A[All nurse locations on map]
+    AD -->|GET /location/visits| B[All active visits]
+    AD -->|GET /location/visit/:id/trail| C[Replay visit route]
+
+    style AD fill:#9C27B0,color:#fff
+    style A fill:#4CAF50,color:#fff
+    style B fill:#2196F3,color:#fff
+    style C fill:#FF9800,color:#fff
 ```
